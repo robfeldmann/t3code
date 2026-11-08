@@ -94,7 +94,7 @@ const VARIANT_CONFIG = {
     assets: PREVIEW_ASSETS,
   },
   production: {
-    appName: "T3 Code",
+    appName: ForkIdentity.mobileDisplayName,
     scheme: ForkIdentity.scheme,
     iosBundleIdentifier: ForkIdentity.appId,
     androidPackage: "com.t3tools.t3code",
