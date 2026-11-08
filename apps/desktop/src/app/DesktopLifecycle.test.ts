@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 
+import { ForkIdentity } from "@t3tools/shared/forkIdentity";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import type * as Electron from "electron";
@@ -262,8 +263,8 @@ describe("DesktopLifecycle", () => {
         Effect.provideService(HostProcess.Arguments, [
           "/opt/T3 Code/t3code",
           "--no-sandbox",
-          "T3CODE://pair?token=spent",
-          "t3code://new?prompt=hello",
+          `${ForkIdentity.scheme.toUpperCase()}://pair?token=spent`,
+          `${ForkIdentity.scheme}://new?prompt=hello`,
         ]),
       );
 

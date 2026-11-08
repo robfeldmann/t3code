@@ -54,14 +54,17 @@ function resolveEarlyDesktopSettingsPath(input: {
   readonly joinPath: JoinPath;
 }): string {
   const t3Home = Option.fromUndefinedOr(input.env.T3CODE_HOME);
+  const isDevelopment = isDevelopmentEnvironment(input.env);
   const baseDir = resolveDesktopBaseDir({
     homeDirectory: input.homeDirectory,
+    isDevelopment,
     joinPath: input.joinPath,
     t3Home,
+    xdgDataHome: Option.fromUndefinedOr(input.env.XDG_DATA_HOME),
   });
   const stateDir = resolveDesktopStateDir({
     baseDir,
-    isDevelopment: isDevelopmentEnvironment(input.env),
+    isDevelopment,
     joinPath: input.joinPath,
     t3Home,
   });

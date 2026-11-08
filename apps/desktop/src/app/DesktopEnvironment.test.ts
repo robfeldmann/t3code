@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import { ForkIdentity } from "@t3tools/shared/forkIdentity";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
@@ -69,7 +70,22 @@ describe("DesktopEnvironment", () => {
       const production = yield* makeEnvironment();
 
       assert.equal(development.stateDir, "/Users/alice/.t3/dev");
-      assert.equal(production.stateDir, "/Users/alice/.t3/userdata");
+      assert.equal(
+        production.stateDir,
+        `/Users/alice/.local/share/${ForkIdentity.dataRootDirName}/userdata`,
+      );
+    }),
+  );
+
+  it.effect("roots production data in an absolute XDG_DATA_HOME only", () =>
+    Effect.gen(function* () {
+      const configured = yield* makeEnvironment({}, { XDG_DATA_HOME: "/data" });
+      const empty = yield* makeEnvironment({}, { XDG_DATA_HOME: "  " });
+      const relative = yield* makeEnvironment({}, { XDG_DATA_HOME: "data" });
+
+      assert.equal(configured.baseDir, `/data/${ForkIdentity.dataRootDirName}`);
+      assert.equal(empty.baseDir, `/Users/alice/.local/share/${ForkIdentity.dataRootDirName}`);
+      assert.equal(relative.baseDir, `/Users/alice/.local/share/${ForkIdentity.dataRootDirName}`);
     }),
   );
 });
