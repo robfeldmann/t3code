@@ -72,6 +72,10 @@ function withExtensionDisplayNameBuildSetting(config, displayName) {
       const buildConfiguration = buildConfigurations[reference.value];
       if (buildConfiguration?.buildSettings) {
         buildConfiguration.buildSettings.INFOPLIST_KEY_CFBundleDisplayName = `"${displayName}"`;
+        // Expo leaves this target without a team, so automatic signing fails when archiving.
+        if (cfg.ios?.appleTeamId) {
+          buildConfiguration.buildSettings.DEVELOPMENT_TEAM = cfg.ios.appleTeamId;
+        }
       }
     }
     return cfg;

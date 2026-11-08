@@ -1,5 +1,6 @@
 export const ForkIdentity = {
   appId: "com.pajamasoft.t3code",
+  appleTeamId: "3MV4WAKDH9",
   productName: "T3 Code (PJS)",
   scheme: "t3code-pjs",
   userDataDirName: "t3code-pjs",

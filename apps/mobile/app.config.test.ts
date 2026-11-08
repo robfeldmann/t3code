@@ -1,7 +1,7 @@
 import { DEFAULT_HOSTED_APP_URL } from "@t3tools/shared/connectAuth";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 
-import appleAppSiteAssociation from "../web/public/.well-known/apple-app-site-association.json";
+import { ForkIdentity } from "../../packages/shared/src/forkIdentity.ts";
 import assetLinks from "../web/public/.well-known/assetlinks.json";
 
 // Keep config parsing independent of local env files and build credentials.
@@ -26,22 +26,42 @@ it.each(["prod", ""])("rejects APP_VARIANT=%j before selecting production IDs", 
 });
 
 it.each([
-  [undefined, "com.t3tools.t3code"],
-  ["development", "com.t3tools.t3code.dev"],
-  ["preview", "com.t3tools.t3code.preview"],
-  ["production", "com.t3tools.t3code"],
-])("keeps the iOS and Android identifiers for APP_VARIANT=%j", async (value, identifier) => {
-  const config = await loadConfig(value);
-  expect(config.ios?.bundleIdentifier).toBe(identifier);
-  expect(config.android?.package).toBe(identifier);
-  // Copied thread links open this app only while app.t3.codes lists it.
-  const host = new URL(DEFAULT_HOSTED_APP_URL).host;
-  expect(config.ios?.associatedDomains).toContain(`applinks:${host}`);
-  expect(appleAppSiteAssociation.applinks.details[0]?.appIDs).toContain(
-    `${config.ios?.appleTeamId}.${identifier}`,
-  );
-  expect(config.android?.intentFilters?.[0]?.data).toEqual([
-    { scheme: "https", host, pathPrefix: "/threads/" },
+  [undefined, ForkIdentity.appId, "com.t3tools.t3code", ForkIdentity.scheme],
+  [
+    "development",
+    `${ForkIdentity.appId}.dev`,
+    "com.t3tools.t3code.dev",
+    `${ForkIdentity.scheme}-dev`,
+  ],
+  [
+    "preview",
+    `${ForkIdentity.appId}.preview`,
+    "com.t3tools.t3code.preview",
+    `${ForkIdentity.scheme}-preview`,
+  ],
+  ["production", ForkIdentity.appId, "com.t3tools.t3code", ForkIdentity.scheme],
+])(
+  "keeps the iOS and Android identifiers for APP_VARIANT=%j",
+  async (value, iosIdentifier, androidPackage, scheme) => {
+    const config = await loadConfig(value);
+    expect(config.ios?.bundleIdentifier).toBe(iosIdentifier);
+    expect(config.ios?.appleTeamId).toBe(ForkIdentity.appleTeamId);
+    expect(config.scheme).toBe(scheme);
+    expect(config.android?.package).toBe(androidPackage);
+    const host = new URL(DEFAULT_HOSTED_APP_URL).host;
+    expect(config.android?.intentFilters?.[0]?.data).toEqual([
+      { scheme: "https", host, pathPrefix: "/threads/" },
+    ]);
+    expect(assetLinks.map((link) => link.target.package_name)).toContain(androidPackage);
+  },
+);
+
+it("keeps the fork off T3's associated domains and OTA feed, with its own keychain group", async () => {
+  const config = await loadConfig("production");
+  expect(config.ios?.associatedDomains).toBeUndefined();
+  expect(config.updates?.enabled).toBe(false);
+  expect(config.updates?.url).toBeUndefined();
+  expect(config.ios?.entitlements?.["keychain-access-groups"]).toEqual([
+    `$(AppIdentifierPrefix)${ForkIdentity.appId}`,
   ]);
-  expect(assetLinks.map((link) => link.target.package_name)).toContain(identifier);
 });

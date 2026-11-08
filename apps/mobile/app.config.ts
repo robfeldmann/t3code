@@ -1,5 +1,6 @@
 import type { ExpoConfig } from "expo/config";
 
+import { ForkIdentity } from "../../packages/shared/src/forkIdentity.ts";
 import { BRAND_ASSET_PATHS } from "../../scripts/lib/brand-assets.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
@@ -80,26 +81,23 @@ const RELEASE_ASSETS = {
 const VARIANT_CONFIG = {
   development: {
     appName: "T3 Code Dev",
-    scheme: "t3code-dev",
-    iosBundleIdentifier: "com.t3tools.t3code.dev",
+    scheme: `${ForkIdentity.scheme}-dev`,
+    iosBundleIdentifier: `${ForkIdentity.appId}.dev`,
     androidPackage: "com.t3tools.t3code.dev",
-    relyingParty: "clerk.t3.codes",
     assets: DEVELOPMENT_ASSETS,
   },
   preview: {
     appName: "T3 Code Preview",
-    scheme: "t3code-preview",
-    iosBundleIdentifier: "com.t3tools.t3code.preview",
+    scheme: `${ForkIdentity.scheme}-preview`,
+    iosBundleIdentifier: `${ForkIdentity.appId}.preview`,
     androidPackage: "com.t3tools.t3code.preview",
-    relyingParty: "clerk.t3.codes",
     assets: PREVIEW_ASSETS,
   },
   production: {
     appName: "T3 Code",
-    scheme: "t3code",
-    iosBundleIdentifier: "com.t3tools.t3code",
+    scheme: ForkIdentity.scheme,
+    iosBundleIdentifier: ForkIdentity.appId,
     androidPackage: "com.t3tools.t3code",
-    relyingParty: "clerk.t3.codes",
     assets: RELEASE_ASSETS,
   },
 } as const;
@@ -135,7 +133,7 @@ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
   {
     bundleIdentifier: `${iosBundleIdentifier}.widgets`,
     groupIdentifier: `group.${iosBundleIdentifier}`,
-    enablePushNotifications: true,
+    enablePushNotifications: false,
     // Frequent updates need the iOS entitlement to avoid early throttling.
     frequentUpdates: true,
     enableAndroid: true,
@@ -241,8 +239,7 @@ const config: ExpoConfig = {
   icon: variant.assets.appIcon,
   userInterfaceStyle: "automatic",
   updates: {
-    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
-    url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+    enabled: false,
     checkAutomatically: "ON_LOAD",
     fallbackToCacheTimeout: 0,
   },
@@ -251,13 +248,11 @@ const config: ExpoConfig = {
     supportsTablet: true,
     requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
+    ...(repoEnv.T3CODE_IOS_BUILD_NUMBER?.trim()
+      ? { buildNumber: repoEnv.T3CODE_IOS_BUILD_NUMBER.trim() }
+      : {}),
     // Avoid Personal Team fallback: it cannot sign App Groups, Apple sign-in or push entitlements.
-    appleTeamId: "ARK85ZXQ4Z",
-    associatedDomains: [
-      `applinks:${variant.relyingParty}`,
-      `webcredentials:${variant.relyingParty}`,
-      `applinks:${HOSTED_APP_HOST}`,
-    ],
+    appleTeamId: ForkIdentity.appleTeamId,
     entitlements: {
       "keychain-access-groups": [`$(AppIdentifierPrefix)${variant.iosBundleIdentifier}`],
     },
@@ -351,6 +346,11 @@ const config: ExpoConfig = {
     ...(isIosPersonalTeamBuild
       ? [sharingPlugin]
       : ["./plugins/withShareExtensionDisplayName.cjs", sharingPlugin]),
+    // Mods run in reverse order; listed before expo-notifications, this strips the entitlements it adds.
+    [
+      "./plugins/withoutIosPersonalTeamCapabilities.cjs",
+      { keepAppGroups: !isIosPersonalTeamBuild },
+    ],
     [
       "expo-notifications",
       {
@@ -359,7 +359,6 @@ const config: ExpoConfig = {
         mode: APP_VARIANT === "development" ? "development" : "production",
       },
     ],
-    // Gate Clerk here: withoutIosPersonalTeamCapabilities runs too early to strip its entitlement.
     ["@clerk/expo", { theme: "./clerk-theme.json", appleSignIn: !isIosPersonalTeamBuild }],
     "expo-web-browser",
     [
@@ -454,7 +453,6 @@ const config: ExpoConfig = {
     "./plugins/withAndroidModernAlertDialog.cjs",
     "./plugins/withAndroidPredictiveBackCompat.cjs",
     "./plugins/withAndroidTabletOrientation.cjs",
-    ...(isIosPersonalTeamBuild ? ["./plugins/withoutIosPersonalTeamCapabilities.cjs"] : []),
   ],
   extra: {
     appVariant: APP_VARIANT,
