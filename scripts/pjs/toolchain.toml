@@ -1,15 +1,16 @@
 # Toolchain for every checkout of the T3 Code fork. It sits beside `.bare`, outside
 # git, so main, dogfood, and topic worktrees all pick it up. Each version comes from
 # the checkout you are in: Node from package.json's engines.node (what CI installs),
-# and vp from the pnpm catalog. This vp only bootstraps `vp i`; once a checkout has
-# node_modules, its own vp comes first on PATH, because `vp test` misbehaves when run
-# from a vite-plus outside the checkout.
+# and vp from the pnpm catalog. Outside a checkout (this folder, `.bare`) they come
+# from `main`. This vp only bootstraps `vp i`; once a checkout has node_modules, its
+# own vp comes first on PATH, because `vp test` misbehaves when run from a vite-plus
+# outside the checkout.
 [tools]
-"npm:vite-plus" = '''{{ exec(command="cd '" ~ cwd ~ "' && awk '$1 == \"vite-plus:\" { print $2; exit }' \"$(git rev-parse --show-toplevel)/pnpm-workspace.yaml\"") }}'''
-node = '''{{ exec(command="cd '" ~ cwd ~ "' && jq -r .engines.node \"$(git rev-parse --show-toplevel)/package.json\"") }}'''
+"npm:vite-plus" = '''{{ exec(command="cd '" ~ cwd ~ "' && top=$(git rev-parse --show-toplevel 2>/dev/null) || top='" ~ config_root ~ "/main'; awk '$1 == \"vite-plus:\" { print $2; exit }' \"$top/pnpm-workspace.yaml\"") }}'''
+node = '''{{ exec(command="cd '" ~ cwd ~ "' && top=$(git rev-parse --show-toplevel 2>/dev/null) || top='" ~ config_root ~ "/main'; jq -r .engines.node \"$top/package.json\"") }}'''
 # The iPhone build's Expo prebuild writes a Podfile; CocoaPods needs a newer Ruby than macOS ships.
 ruby = "4.0.9"
 cocoapods = "1.17.0"
 
 [env]
-_.path = '''{{ exec(command="cd '" ~ cwd ~ "' && echo \"$(git rev-parse --show-toplevel)/node_modules/.bin\"") }}'''
+_.path = '''{{ exec(command="cd '" ~ cwd ~ "' && top=$(git rev-parse --show-toplevel 2>/dev/null) || top='" ~ config_root ~ "/main'; echo \"$top/node_modules/.bin\"") }}'''
