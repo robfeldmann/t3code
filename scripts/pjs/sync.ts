@@ -8,6 +8,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 import * as Console from "effect/Console";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -119,6 +120,22 @@ export const selectBaseTag = (train: Train, tags: ReadonlyArray<string>) => {
 const Flavor = Schema.Literals(["signed", "notarized"]);
 type Flavor = typeof Flavor.Type;
 
+const PhoneInputs = Schema.Struct({
+  // Hash of the fork's own diff to the phone's inputs, and the native fingerprint, at one dogfood HEAD.
+  delta: Schema.String,
+  fingerprint: Schema.String,
+});
+type PhoneInputs = typeof PhoneInputs.Type;
+
+const TestflightUpload = Schema.Struct({
+  buildNumber: Schema.String,
+  uploadedAt: Schema.DateTimeUtcFromString,
+  baseTag: Schema.String,
+  head: Schema.String,
+  ...PhoneInputs.fields,
+});
+type TestflightUpload = typeof TestflightUpload.Type;
+
 const BuildRecord = Schema.Struct({
   toolVersion: Schema.Number,
   flavor: Flavor,
@@ -129,9 +146,14 @@ const BuildRecord = Schema.Struct({
   appName: Schema.String,
   bundleId: Schema.String,
   installed: Schema.Boolean,
+  phone: Schema.optional(PhoneInputs),
+  testflight: Schema.optional(TestflightUpload),
 });
 export type BuildRecord = typeof BuildRecord.Type;
-export type BuildInputs = Omit<BuildRecord, "appName" | "bundleId" | "installed">;
+export type BuildInputs = Omit<
+  BuildRecord,
+  "appName" | "bundleId" | "installed" | "phone" | "testflight"
+>;
 
 type SyncAction = "build" | "install" | "up-to-date";
 
@@ -160,6 +182,57 @@ export const decideAction = (input: {
   if (input.install && !last.installed)
     return { action: "install", reason: "the built app is not installed" };
   return { action: "up-to-date", reason: "base, branch heads, and tool are unchanged" };
+};
+
+const DAY_MILLIS = 86_400_000;
+const TESTFLIGHT_LIFETIME_DAYS = 90;
+const EXPIRY_WARNING_DAYS = 10;
+const BASE_LAG_DAYS = 14;
+
+/** Why the last TestFlight upload is behind, in words; empty when it is not. */
+export const phoneBehind = (input: {
+  readonly upload: TestflightUpload | undefined;
+  /** The phone inputs of the dogfood checkout as of the last desktop build. */
+  readonly current: PhoneInputs | undefined;
+  readonly nowMillis: number;
+  readonly uploadBaseMillis: number | undefined;
+  readonly desktopBaseMillis: number | undefined;
+}): ReadonlyArray<string> => {
+  const { upload, current } = input;
+  if (!upload) return [];
+  const reasons: Array<string> = [];
+  if (current && current.delta !== upload.delta) {
+    reasons.push("the fork's changes to the phone's inputs differ");
+  }
+  if (current && current.fingerprint !== upload.fingerprint) {
+    reasons.push("the native fingerprint differs");
+  }
+  const remaining =
+    DateTime.toEpochMillis(upload.uploadedAt) +
+    TESTFLIGHT_LIFETIME_DAYS * DAY_MILLIS -
+    input.nowMillis;
+  if (remaining < EXPIRY_WARNING_DAYS * DAY_MILLIS) {
+    reasons.push(
+      remaining <= 0
+        ? "it has expired"
+        : `it expires in ${Math.floor(remaining / DAY_MILLIS)} days`,
+    );
+  }
+  if (input.desktopBaseMillis !== undefined && input.uploadBaseMillis !== undefined) {
+    const lag = input.desktopBaseMillis - input.uploadBaseMillis;
+    if (lag > BASE_LAG_DAYS * DAY_MILLIS) {
+      reasons.push(
+        `its base is ${Math.floor(lag / DAY_MILLIS)} days older than the desktop build's`,
+      );
+    }
+  }
+  return reasons;
+};
+
+/** The TestFlight build number: the UTC time to the minute, which rises with every upload. */
+export const iosBuildNumber = (now: DateTime.Utc) => {
+  const { year, month, day, hour, minute } = DateTime.toPartsUtc(now);
+  return [year, month, day, hour, minute].map((part) => String(part).padStart(2, "0")).join("");
 };
 
 export const conflictPrompt = (input: {
@@ -232,11 +305,19 @@ const capture = Effect.fn("pjsSync.capture")(function* (
   command: string,
   args: ReadonlyArray<string>,
   cwd: string,
+  env?: Record<string, string>,
+  input?: string,
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const context = { command: commandLine(command, args), cwd } as const;
   const child = yield* spawner
-    .spawn(ChildProcess.make(command, [...args], { cwd }))
+    .spawn(
+      ChildProcess.make(command, [...args], {
+        cwd,
+        ...(env ? { env, extendEnv: true } : {}),
+        ...(input === undefined ? {} : { stdin: Stream.make(new TextEncoder().encode(input)) }),
+      }),
+    )
     .pipe(
       Effect.mapError((cause) => new SyncCommandError({ ...context, operation: "spawn", cause })),
     );
@@ -682,7 +763,7 @@ export const installApp = Effect.fn("pjsSync.installApp")(function* (
 });
 
 /** Installs the built app and records it as installed; a refused install leaves the record as built. */
-export const installBuilt = Effect.fn("pjsSync.installBuilt")(function* (
+const installBuilt = Effect.fn("pjsSync.installBuilt")(function* (
   stateFile: string,
   record: BuildRecord,
   source: string,
@@ -692,6 +773,34 @@ export const installBuilt = Effect.fn("pjsSync.installBuilt")(function* (
   const installed = { ...record, installed: true };
   yield* writeState(stateFile, installed);
   return installed;
+});
+
+/**
+ * Records a finished build as not installed, so a refused or skipped install is finished by a
+ * later run without rebuilding, then installs it unless told not to.
+ */
+export const finishBuild = Effect.fn("pjsSync.finishBuild")(function* (
+  stateFile: string,
+  record: BuildRecord,
+  source: string,
+  destinationDir: string,
+  install: boolean,
+) {
+  yield* writeState(stateFile, record);
+  return install ? yield* installBuilt(stateFile, record, source, destinationDir) : record;
+});
+
+/** dogfood is script-owned: uncommitted changes or an unfinished merge there stop a sync or upload. */
+const requireCleanDogfood = Effect.fn("pjsSync.requireCleanDogfood")(function* (
+  dogfoodDir: string,
+) {
+  const dirty = yield* git(dogfoodDir, ["status", "--porcelain"]);
+  const merging = yield* gitProbe(dogfoodDir, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+  if (dirty.length > 0 || merging.exitCode === 0) {
+    return yield* new SyncSetupError({
+      detail: `${dogfoodDir} has uncommitted changes or an unfinished merge; commit or discard them first (git -C ${dogfoodDir} merge --abort ends a merge).`,
+    });
+  }
 });
 
 export const ensureDogfood = Effect.fn("pjsSync.ensureDogfood")(function* (
@@ -710,13 +819,7 @@ export const ensureDogfood = Effect.fn("pjsSync.ensureDogfood")(function* (
         detail: `${repo.dogfoodDir} exists but is not a worktree of ${repo.gitDir}. Move it away first.`,
       });
     }
-    const dirty = yield* git(repo.dogfoodDir, ["status", "--porcelain"]);
-    const merging = yield* gitProbe(repo.dogfoodDir, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
-    if (dirty.length > 0 || merging.exitCode === 0) {
-      return yield* new SyncSetupError({
-        detail: `${repo.dogfoodDir} has uncommitted changes or an unfinished merge; commit or discard them first (git -C ${repo.dogfoodDir} merge --abort ends a merge).`,
-      });
-    }
+    yield* requireCleanDogfood(repo.dogfoodDir);
     yield* git(repo.dogfoodDir, ["checkout", "-q", "-B", DOGFOOD_BRANCH, `refs/tags/${baseTag}`]);
     return;
   }
@@ -842,6 +945,7 @@ interface SyncOptions {
   readonly force: boolean;
   readonly notarize: boolean;
   readonly noInstall: boolean;
+  readonly testflight: boolean;
 }
 
 const configureBranches = Effect.fn("pjsSync.configureBranches")(function* (
@@ -880,6 +984,33 @@ const configureBranches = Effect.fn("pjsSync.configureBranches")(function* (
 
 const listTags = (gitDir: string) => gitLines(gitDir, ["tag", "--list", "v*"]);
 
+/** Commit time of a tag in milliseconds, or undefined when the tag is not here. */
+const tagMillis = Effect.fn("pjsSync.tagMillis")(function* (gitDir: string, tag: string) {
+  const result = yield* gitProbe(gitDir, ["log", "-1", "--format=%ct", `refs/tags/${tag}`]);
+  return result.exitCode === 0 ? Number(result.stdout.trim()) * 1000 : undefined;
+});
+
+const checkPhone = Effect.fn("pjsSync.checkPhone")(function* (
+  repo: Repository,
+  last: BuildRecord | undefined,
+) {
+  const upload = last?.testflight;
+  if (!last || !upload) return;
+  const now = yield* DateTime.now;
+  const reasons = phoneBehind({
+    upload,
+    current: last.phone,
+    nowMillis: DateTime.toEpochMillis(now),
+    uploadBaseMillis: yield* tagMillis(repo.gitDir, upload.baseTag),
+    desktopBaseMillis: yield* tagMillis(repo.gitDir, last.baseTag),
+  });
+  if (reasons.length > 0) {
+    yield* Console.log(
+      `t3code-pjs: iPhone build ${upload.buildNumber} is behind: ${reasons.join("; ")} (--testflight uploads a new one)`,
+    );
+  }
+});
+
 const checkOutdated = Effect.fn("pjsSync.checkOutdated")(function* (repo: Repository) {
   const { train } = yield* readTrain(repo.gitDir);
   // Offline or rejected fetches fall back to the tags already here; the check stays quiet.
@@ -891,15 +1022,324 @@ const checkOutdated = Effect.fn("pjsSync.checkOutdated")(function* (repo: Reposi
     "refs/tags/*:refs/tags/*",
   ]);
   const baseTag = selectBaseTag(train, yield* listTags(repo.gitDir));
-  if (baseTag === undefined) return;
   const last = yield* statePath().pipe(Effect.flatMap(readState));
-  if (last?.baseTag !== baseTag) {
-    yield* Console.log(
-      `t3code-pjs: ${baseTag} available (${last ? `built from ${last.baseTag}` : "not built yet"})`,
-    );
-  } else if (!last.installed) {
-    yield* Console.log(`t3code-pjs: ${baseTag} built, not installed`);
+  if (baseTag !== undefined) {
+    if (last?.baseTag !== baseTag) {
+      yield* Console.log(
+        `t3code-pjs: ${baseTag} available (${last ? `built from ${last.baseTag}` : "not built yet"})`,
+      );
+    } else if (!last.installed) {
+      yield* Console.log(`t3code-pjs: ${baseTag} built, not installed`);
+    }
   }
+  yield* checkPhone(repo, last);
+});
+
+// The whole tree minus what only the desktop app, the server, or the web client use, and the
+// repository's own scripts in scripts/ (scripts/lib stays: app.config.ts imports it). Packages
+// are not excluded one by one, so an unrelated fork change there costs a "behind" line at worst.
+const PHONE_INPUT_PATHSPEC = [
+  ".",
+  ":(exclude)apps/desktop",
+  ":(exclude)apps/server",
+  ":(exclude)apps/web",
+  ":(exclude,glob)scripts/*.*",
+];
+const IOS_ENV = { APP_VARIANT: "production", EXPO_NO_GIT_STATUS: "1" } as const;
+
+/**
+ * The fork's own changes to the phone's inputs, as a patch id: it ignores blob ids, hunk line
+ * numbers, and context, so an upstream edit near the fork's change leaves it alone.
+ */
+export const forkDelta = Effect.fn("pjsSync.forkDelta")(function* (
+  dogfoodDir: string,
+  baseRef: string,
+) {
+  const diffArgs = [
+    "diff",
+    "-U0",
+    "--binary",
+    "--no-ext-diff",
+    baseRef,
+    "HEAD",
+    "--",
+    ...PHONE_INPUT_PATHSPEC,
+  ];
+  const diff = yield* gitProbe(dogfoodDir, diffArgs);
+  const patchIdArgs = ["patch-id", "--stable"];
+  const patchId = yield* capture("git", patchIdArgs, dogfoodDir, undefined, diff.stdout);
+  for (const [args, result] of [
+    [diffArgs, diff],
+    [patchIdArgs, patchId],
+  ] as const) {
+    if (result.exitCode !== 0) {
+      return yield* new SyncCommandError({
+        command: commandLine("git", args),
+        cwd: dogfoodDir,
+        operation: "exit",
+        exitCode: result.exitCode,
+        stderr: result.stderr,
+      });
+    }
+  }
+  // An empty diff makes no patch id.
+  return patchId.stdout.split(" ")[0]?.trim() || "none";
+});
+
+const decodeFingerprint = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ hash: Schema.String })),
+);
+
+/** The native fingerprint the repo's mobile-fingerprint-check.yml compares, for the iOS build. */
+const nativeFingerprint = Effect.fn("pjsSync.nativeFingerprint")(function* (dogfoodDir: string) {
+  const path = yield* Path.Path;
+  const mobileDir = path.join(dogfoodDir, "apps/mobile");
+  const args = ["exec", "--", "npx", "expo-updates", "fingerprint:generate", "--platform", "ios"];
+  const result = yield* capture("mise", args, mobileDir, IOS_ENV);
+  if (result.exitCode !== 0) {
+    return yield* new SyncCommandError({
+      command: commandLine("mise", args),
+      cwd: mobileDir,
+      operation: "exit",
+      exitCode: result.exitCode,
+      stderr: result.stderr,
+    });
+  }
+  const { hash } = yield* decodeFingerprint(result.stdout).pipe(
+    Effect.mapError(
+      (cause) =>
+        new SyncSetupError({ detail: `Could not read the native fingerprint: ${String(cause)}` }),
+    ),
+  );
+  return hash;
+});
+
+const phoneInputs = Effect.fn("pjsSync.phoneInputs")(function* (
+  dogfoodDir: string,
+  baseRef: string,
+) {
+  return {
+    delta: yield* forkDelta(dogfoodDir, baseRef),
+    fingerprint: yield* nativeFingerprint(dogfoodDir),
+  };
+});
+
+const exportOptionsPlist = (teamId: string) =>
+  [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    "<dict>",
+    "  <key>method</key><string>app-store-connect</string>",
+    "  <key>destination</key><string>upload</string>",
+    `  <key>teamID</key><string>${teamId}</string>`,
+    "  <key>signingStyle</key><string>automatic</string>",
+    "  <key>manageAppVersionAndBuildNumber</key><false/>",
+    "  <key>testFlightInternalTestingOnly</key><true/>",
+    "  <key>uploadSymbols</key><true/>",
+    "</dict>",
+    "</plist>",
+    "",
+  ].join("\n");
+
+interface PhoneStep {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly cwd: string;
+  readonly env: Record<string, string>;
+}
+
+const prebuildStep = (mobileDir: string, buildNumber: string): PhoneStep => ({
+  command: "mise",
+  args: ["exec", "--", "npx", "expo", "prebuild", "--clean", "--platform", "ios"],
+  cwd: mobileDir,
+  env: { ...IOS_ENV, T3CODE_IOS_BUILD_NUMBER: buildNumber },
+});
+
+/** The archive and upload commands; they need the project name that `expo prebuild` chose. */
+const uploadSteps = (input: {
+  readonly mobileDir: string;
+  readonly projectName: string;
+  readonly archivePath: string;
+  readonly exportPath: string;
+  readonly exportOptions: string;
+}) => {
+  const xcodebuild = (...args: ReadonlyArray<string>): PhoneStep => ({
+    command: "mise",
+    args: ["exec", "--", "xcodebuild", ...args],
+    cwd: input.mobileDir,
+    env: {},
+  });
+  const signing = ["-allowProvisioningUpdates", "-IDEPackageOnlyUseVersionsFromResolvedFile=NO"];
+  return {
+    archive: xcodebuild(
+      "archive",
+      "-workspace",
+      `ios/${input.projectName}.xcworkspace`,
+      "-scheme",
+      input.projectName,
+      "-configuration",
+      "Release",
+      "-destination",
+      "generic/platform=iOS",
+      "-archivePath",
+      input.archivePath,
+      "-derivedDataPath",
+      "ios/build/dd",
+      ...signing,
+      "-quiet",
+    ),
+    upload: xcodebuild(
+      "-exportArchive",
+      "-archivePath",
+      input.archivePath,
+      "-exportOptionsPlist",
+      input.exportOptions,
+      "-exportPath",
+      input.exportPath,
+      ...signing,
+    ),
+  };
+};
+
+/** Builds and uploads the iPhone app; only an upload that went through is recorded. */
+export const uploadPhone = Effect.fn("pjsSync.uploadPhone")(function* (input: {
+  readonly stateFile: string;
+  readonly record: BuildRecord;
+  readonly mobileDir: string;
+  readonly iosDir: string;
+  readonly buildNumber: string;
+  readonly teamId: string;
+  readonly inputs: PhoneInputs;
+  readonly head: string;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const exportOptions = path.join(input.iosDir, "ExportOptions.plist");
+  const exportPath = path.join(input.iosDir, "export");
+  yield* fs
+    .makeDirectory(input.iosDir, { recursive: true })
+    .pipe(fileSystemError("create", input.iosDir));
+  yield* fs
+    .writeFileString(exportOptions, exportOptionsPlist(input.teamId))
+    .pipe(fileSystemError("write", exportOptions));
+  yield* fs
+    .remove(exportPath, { recursive: true, force: true })
+    .pipe(fileSystemError("remove", exportPath));
+
+  const prebuild = prebuildStep(input.mobileDir, input.buildNumber);
+  yield* run(prebuild.command, prebuild.args, prebuild);
+  const iosRoot = path.join(input.mobileDir, "ios");
+  const workspaces = (yield* fs
+    .readDirectory(iosRoot)
+    .pipe(fileSystemError("read", iosRoot))).filter((entry) => entry.endsWith(".xcworkspace"));
+  const [workspace] = workspaces;
+  if (workspaces.length !== 1 || workspace === undefined) {
+    return yield* new SyncSetupError({
+      detail: `expo prebuild left ${workspaces.length} .xcworkspace folders in ${iosRoot}${workspaces.length > 0 ? ` (${workspaces.join(", ")})` : ""}; expected exactly one.`,
+    });
+  }
+  const projectName = path.basename(workspace, ".xcworkspace");
+  const archivePath = path.join(input.iosDir, `${projectName}-${input.buildNumber}.xcarchive`);
+  const { archive, upload } = uploadSteps({
+    mobileDir: input.mobileDir,
+    projectName,
+    archivePath,
+    exportPath,
+    exportOptions,
+  });
+  yield* run(archive.command, archive.args, archive);
+  yield* run(upload.command, upload.args, upload);
+
+  const uploadedAt = yield* DateTime.now;
+  const uploaded = {
+    buildNumber: input.buildNumber,
+    uploadedAt,
+    baseTag: input.record.baseTag,
+    head: input.head,
+    ...input.inputs,
+  };
+  yield* writeState(input.stateFile, {
+    ...input.record,
+    phone: input.inputs,
+    testflight: uploaded,
+  });
+  yield* fs.remove(exportPath, { recursive: true, force: true }).pipe(Effect.ignore);
+  for (const entry of yield* fs
+    .readDirectory(input.iosDir)
+    .pipe(fileSystemError("read", input.iosDir))) {
+    if (entry.endsWith(".xcarchive") && entry !== path.basename(archivePath)) {
+      yield* fs
+        .remove(path.join(input.iosDir, entry), { recursive: true, force: true })
+        .pipe(Effect.ignore);
+    }
+  }
+  return uploaded;
+});
+
+const testflight = Effect.fn("pjsSync.testflight")(function* (
+  repo: Repository,
+  options: SyncOptions,
+) {
+  const path = yield* Path.Path;
+  const stateFile = yield* statePath();
+  const iosDir = path.join(path.dirname(stateFile), "ios");
+  const mobileDir = path.join(repo.dogfoodDir, "apps/mobile");
+  const buildNumber = iosBuildNumber(yield* DateTime.now);
+
+  if (options.dryRun) {
+    const identity = Option.getOrUndefined(yield* Effect.option(loadIdentity(repo.dogfoodDir)));
+    // expo prebuild names the project; the real run reads the name from the one workspace it leaves.
+    const projectName = "<workspace from prebuild>";
+    const exportOptions = path.join(iosDir, "ExportOptions.plist");
+    const steps = [
+      prebuildStep(mobileDir, buildNumber),
+      ...Object.values(
+        uploadSteps({
+          mobileDir,
+          projectName,
+          archivePath: path.join(iosDir, `${projectName}-${buildNumber}.xcarchive`),
+          exportPath: path.join(iosDir, "export"),
+          exportOptions,
+        }),
+      ),
+    ];
+    const previous = (yield* readState(stateFile))?.testflight;
+    yield* Console.log(
+      [
+        `iPhone: upload build ${buildNumber} to TestFlight (${previous ? `last upload: build ${previous.buildNumber} on ${DateTime.formatIso(previous.uploadedAt)}` : "no upload recorded"})`,
+        `  ${exportOptions} is written first (app-store-connect, upload, team ${identity?.appleTeamId ?? "<team id from forkIdentity.ts>"}); the project, workspace, and scheme name is the one ios/*.xcworkspace that step 1 leaves; steps:`,
+        ...steps.map(
+          (step) =>
+            `    (cd ${step.cwd}) ${[...Object.entries(step.env).map(([name, value]) => `${name}=${value}`), step.command, ...step.args].join(" ")}`,
+        ),
+        `  then the upload is recorded in ${stateFile} and older archives in ${iosDir} are deleted`,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const record = yield* readState(stateFile);
+  if (!record) {
+    return yield* new SyncSetupError({
+      detail: "No desktop build is recorded, so there is no dogfood to build the iPhone app from.",
+    });
+  }
+  yield* requireCleanDogfood(repo.dogfoodDir);
+  const identity = yield* loadIdentity(repo.dogfoodDir);
+  const uploaded = yield* uploadPhone({
+    stateFile,
+    record,
+    mobileDir,
+    iosDir,
+    buildNumber,
+    teamId: identity.appleTeamId,
+    inputs: yield* phoneInputs(repo.dogfoodDir, `refs/tags/${record.baseTag}`),
+    head: yield* git(repo.dogfoodDir, ["rev-parse", "HEAD"]),
+  });
+  yield* Console.log(
+    `uploaded iPhone build ${uploaded.buildNumber} to TestFlight (base ${uploaded.baseTag}, dogfood ${uploaded.head.slice(0, 10)})`,
+  );
 });
 
 const sync = Effect.fn("pjsSync.sync")(function* (repo: Repository, options: SyncOptions) {
@@ -1002,9 +1442,13 @@ const sync = Effect.fn("pjsSync.sync")(function* (repo: Repository, options: Syn
   }
 
   const finish = Effect.fn("pjsSync.finish")(function* (record: BuildRecord, verb: string) {
-    const result = install
-      ? yield* installBuilt(stateFile, record, releaseApp(record.appName), INSTALL_DIR)
-      : record;
+    const result = yield* finishBuild(
+      stateFile,
+      record,
+      releaseApp(record.appName),
+      INSTALL_DIR,
+      install,
+    );
     yield* Console.log(`${verb}:\n${summarize(result.appName)}`);
   });
   if (decision.action === "install" && last) return yield* finish(last, "installed");
@@ -1034,13 +1478,21 @@ const sync = Effect.fn("pjsSync.sync")(function* (repo: Repository, options: Syn
   yield* run("mise", ["exec", "--", "vp", "i"], { cwd: repo.dogfoodDir });
   const identity = yield* loadIdentity(repo.dogfoodDir);
   yield* buildApp(repo.dogfoodDir, identity, options.notarize);
+  const phone = yield* phoneInputs(repo.dogfoodDir, baseRef).pipe(
+    Effect.catch((error) =>
+      Console.error(
+        `t3code-pjs: WARNING: could not compute the iPhone inputs, so --check cannot tell when the phone build is behind until the next build: ${error.message}`,
+      ).pipe(Effect.as(undefined)),
+    ),
+  );
   const built = {
     ...current,
     appName: identity.appName,
     bundleId: identity.appId,
     installed: false,
+    phone,
+    testflight: last?.testflight,
   } satisfies BuildRecord;
-  yield* writeState(stateFile, built);
   yield* finish(built, "built");
 });
 
@@ -1051,6 +1503,7 @@ const resolveMode = Effect.fn("pjsSync.resolveMode")(function* (options: SyncOpt
     options.force && "--force",
     options.notarize && "--notarize",
     options.noInstall && "--no-install",
+    options.testflight && "--testflight",
   ].filter((flag) => flag !== false);
   if (configuring && (options.check || syncFlags.length > 0)) {
     return yield* new SyncSetupError({
@@ -1068,7 +1521,24 @@ const program = Effect.fn("pjsSync.program")(function* (options: SyncOptions) {
   const repo = yield* resolveRepository();
   if (mode === "configure") return yield* configureBranches(repo, options);
   if (mode === "check") return yield* checkOutdated(repo);
-  return yield* sync(repo, options);
+  if (!options.testflight) return yield* sync(repo, options);
+  // A running app only blocks the desktop install; the phone upload does not depend on it.
+  const blocked = yield* sync(repo, options).pipe(
+    Effect.as(undefined),
+    Effect.catchTags({
+      SyncInstallBlockedError: (blockedInstall) =>
+        Console.error(`t3code-pjs: ${blockedInstall.message}`).pipe(Effect.as(blockedInstall)),
+    }),
+  );
+  if (blocked === undefined) return yield* testflight(repo, options);
+  // The blocked install stays the outcome (exit 4) whether or not the upload works.
+  yield* testflight(repo, options).pipe(
+    Effect.tapError((error) => Console.error(`t3code-pjs: ${error.message}`)),
+    Effect.ignore,
+  );
+  return yield* new SyncInstallBlockedError({
+    report: "the desktop app was not installed because it is running (see the warning above).",
+  });
 });
 
 const HELP = [
@@ -1087,6 +1557,14 @@ const HELP = [
   "scripts/pjs/toolchain.toml; a missing mise.toml is recreated from it and trusted. A branch whose",
   "merge into the base changes nothing, because upstream absorbed it, is dropped from the list (never",
   "fork/identity) and its delete command is printed.",
+  "",
+  "--testflight, after the sync (or alone when dogfood is up to date), builds the iPhone app from dogfood",
+  "(expo prebuild, xcodebuild archive, then an export that uploads it) with a UTC-timestamp build number,",
+  "and records the upload in the state file; archives and the export options live in",
+  "$XDG_STATE_HOME/t3code-pjs/ios. --check says when that phone build is behind: the fork's changes to the",
+  "phone's inputs or the native fingerprint differ from it, it expires within 10 days (TestFlight keeps a",
+  "build 90 days), or its base is more than 14 days older than the desktop build's. A plain sync never",
+  "uploads.",
   "",
   "Config, in the repository's git config (shared by every worktree):",
   `  ${BRANCH_KEY}  branch to merge; several are merged in the order stored; default ${IDENTITY_BRANCH}`,
@@ -1130,6 +1608,12 @@ const pjsSyncCommand = Command.make("pjs-sync", {
   ),
   noInstall: Flag.Boolean("no-install").pipe(
     Flag.withDescription("Build, but leave the app in dogfood/release."),
+    Flag.withDefault(false),
+  ),
+  testflight: Flag.Boolean("testflight").pipe(
+    Flag.withDescription(
+      "After the sync, build the iPhone app from dogfood and upload it to TestFlight.",
+    ),
     Flag.withDefault(false),
   ),
 }).pipe(

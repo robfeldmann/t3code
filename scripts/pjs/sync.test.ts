@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -10,13 +11,15 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import {
   conflictPrompt,
+  finishBuild,
   decideAction,
   ensureDogfood,
   findDriftedBranches,
   findMergedBranches,
+  forkDelta,
   git,
   installApp,
-  installBuilt,
+  iosBuildNumber,
   loadIdentity,
   mergeBranches,
   readState,
@@ -25,6 +28,8 @@ import {
   selectBaseTag,
   toolchainStatus,
   TOOL_VERSION,
+  uploadPhone,
+  phoneBehind,
   writeState,
   type BuildInputs,
   type BuildRecord,
@@ -77,11 +82,28 @@ const repoWithFile = Effect.fn("repoWithFile")(function* (root: string) {
   return { dir, commit };
 });
 
-/** Stands in for lsappinfo, mise, and ditto; records each invocation. */
+const changeFile = Effect.fn("changeFile")(function* (
+  dir: string,
+  file: string,
+  content: string | Uint8Array,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const target = path.join(dir, file);
+  yield* fs.makeDirectory(path.dirname(target), { recursive: true });
+  yield* typeof content === "string"
+    ? fs.writeFileString(target, content)
+    : fs.writeFile(target, content);
+  yield* git(dir, ["add", file]);
+  yield* git(dir, ["commit", "-q", "-m", file]);
+});
+
+/** Stands in for lsappinfo, mise, ditto, and xcodebuild; records each invocation. */
 function stubSpawner(
   running: boolean,
   onSpawn: (argv: ReadonlyArray<string>) => Effect.Effect<void, PlatformError.PlatformError> = () =>
     Effect.void,
+  exitCodeFor: (argv: ReadonlyArray<string>) => number = () => 0,
 ) {
   const calls: Array<ReadonlyArray<string>> = [];
   const spawner = ChildProcessSpawner.make((command) => {
@@ -94,7 +116,7 @@ function stubSpawner(
       Effect.map(() =>
         ChildProcessSpawner.makeHandle({
           pid: ChildProcessSpawner.ProcessId(1),
-          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(exitCodeFor(argv))),
           isRunning: Effect.succeed(false),
           kill: () => Effect.void,
           unref: Effect.succeed(Effect.void),
@@ -481,38 +503,58 @@ it.layer(NodeServices.layer)("pjs sync", (it) => {
     ),
   );
 
-  it.effect("records a refused install as not installed, then installs without rebuilding", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const root = yield* fs.makeTempDirectoryScoped({ prefix: "pjs-sync-install-" });
-      const stateFile = path.join(root, "state", "sync.json");
-      const destinationDir = path.join(root, "Applications");
-      yield* fs.makeDirectory(destinationDir);
-      const unfinished = { ...lastBuild, installed: false };
-      yield* writeState(stateFile, unfinished);
-      const stubFor = (running: boolean) =>
-        stubSpawner(running, (argv) =>
-          argv[0] === "ditto" ? fs.makeDirectory(argv[2] ?? "", { recursive: true }) : Effect.void,
-        );
-      const install = (spawner: ChildProcessSpawner.ChildProcessSpawner["Service"]) =>
-        installBuilt(stateFile, unfinished, "/build/Example.app", destinationDir).pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        );
+  it.effect(
+    "records a finished build before installing it, so a refused or skipped install is finished later",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "pjs-sync-install-" });
+        const stateFile = path.join(root, "state", "sync.json");
+        const destinationDir = path.join(root, "Applications");
+        yield* fs.makeDirectory(destinationDir);
+        const fresh: BuildRecord = {
+          ...lastBuild,
+          baseTag: "v0.1.9-nightly.20261201.1",
+          installed: false,
+        };
+        const stubFor = (running: boolean) =>
+          stubSpawner(running, (argv) =>
+            argv[0] === "ditto"
+              ? fs.makeDirectory(argv[2] ?? "", { recursive: true })
+              : Effect.void,
+          );
+        const finish = (
+          spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+          install: boolean,
+        ) =>
+          finishBuild(stateFile, fresh, "/build/Example.app", destinationDir, install).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          );
 
-      const refused = yield* install(stubFor(true).spawner).pipe(Effect.flip);
-      assert.strictEqual(refused._tag, "SyncInstallBlockedError");
-      assert.strictEqual((yield* readState(stateFile))?.installed, false);
+        // The app is running: the install is refused, and the new build is on record as not installed.
+        const refused = yield* finish(stubFor(true).spawner, true).pipe(Effect.flip);
+        assert.strictEqual(refused._tag, "SyncInstallBlockedError");
+        const recorded = yield* readState(stateFile);
+        assert.strictEqual(recorded?.baseTag, fresh.baseTag);
+        assert.strictEqual(recorded?.installed, false);
 
-      const next = decide({ last: yield* readState(stateFile) });
-      assert.strictEqual(next.action, "install");
+        // The next run installs that build without rebuilding it.
+        const next = decide({ last: recorded, current: { ...inputs, baseTag: fresh.baseTag } });
+        assert.strictEqual(next.action, "install");
+        const quiet = stubFor(false);
+        yield* finish(quiet.spawner, true);
+        assert.strictEqual((yield* readState(stateFile))?.installed, true);
+        assert.isTrue(yield* fs.exists(path.join(destinationDir, "Example.app")));
+        assert.isFalse(quiet.calls.some((argv) => argv[0] === "mise"));
 
-      const quiet = stubFor(false);
-      yield* install(quiet.spawner);
-      assert.strictEqual((yield* readState(stateFile))?.installed, true);
-      assert.isTrue(yield* fs.exists(path.join(destinationDir, "Example.app")));
-      assert.isFalse(quiet.calls.some((argv) => argv[0] === "mise"));
-    }),
+        // --no-install records the build too, and touches nothing else.
+        yield* fs.remove(stateFile);
+        const skipped = stubFor(true);
+        yield* finish(skipped.spawner, false);
+        assert.strictEqual((yield* readState(stateFile))?.installed, false);
+        assert.deepStrictEqual(skipped.calls, []);
+      }),
   );
 
   it.effect("reads the build's identity from forkIdentity.ts and stops clearly without it", () =>
@@ -548,5 +590,221 @@ it.layer(NodeServices.layer)("pjs sync", (it) => {
       ).pipe(Effect.flip);
       assert.strictEqual(partial._tag, "SyncSetupError");
     }),
+  );
+
+  it.effect("records an upload only when every step went through", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "pjs-sync-upload-" });
+      const mobileDir = path.join(root, "dogfood/apps/mobile");
+      const iosDir = path.join(root, "state/ios");
+      const stateFile = path.join(root, "state/sync.json");
+      const previous: BuildRecord = {
+        ...lastBuild,
+        phone: { delta: "d0", fingerprint: "f0" },
+        testflight: {
+          buildNumber: "1",
+          uploadedAt: DateTime.makeUnsafe("2026-11-01T00:00:00Z"),
+          baseTag: lastBuild.baseTag,
+          head: "h0",
+          delta: "d0",
+          fingerprint: "f0",
+        },
+      };
+      yield* writeState(stateFile, previous);
+      yield* fs.makeDirectory(path.join(iosDir, "Old-1.xcarchive"), { recursive: true });
+      // expo prebuild --clean replaces ios/ with a fresh project.
+      const prebuild = Effect.fn("prebuild")(function* (workspaces: ReadonlyArray<string>) {
+        const ios = path.join(mobileDir, "ios");
+        yield* fs.remove(ios, { recursive: true, force: true });
+        yield* fs.makeDirectory(ios, { recursive: true });
+        for (const workspace of workspaces) yield* fs.makeDirectory(path.join(ios, workspace));
+      });
+      const upload = (options: { workspaces: ReadonlyArray<string>; failing?: string }) => {
+        const stub = stubSpawner(
+          false,
+          (argv) => (argv.includes("prebuild") ? prebuild(options.workspaces) : Effect.void),
+          (argv) => (options.failing && argv.includes(options.failing) ? 1 : 0),
+        );
+        const result = uploadPhone({
+          stateFile,
+          record: previous,
+          mobileDir,
+          iosDir,
+          buildNumber: "202611090001",
+          teamId: "TEAM123456",
+          inputs: { delta: "d1", fingerprint: "f1" },
+          head: "h1",
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, stub.spawner));
+        return { stub, result };
+      };
+      const recordedBuild = Effect.map(
+        readState(stateFile),
+        (record) => record?.testflight?.buildNumber,
+      );
+
+      // A failing archive stops before the upload step, and the earlier record stands.
+      const failing = upload({ workspaces: ["Example.xcworkspace"], failing: "archive" });
+      assert.strictEqual((yield* failing.result.pipe(Effect.flip))._tag, "SyncCommandError");
+      assert.isFalse(failing.stub.calls.some((argv) => argv.includes("-exportArchive")));
+      assert.strictEqual(yield* recordedBuild, "1");
+
+      // The project name is the one workspace the prebuild leaves; none or several is an error.
+      for (const workspaces of [[], ["A.xcworkspace", "B.xcworkspace"]]) {
+        const unclear = upload({ workspaces });
+        const error = yield* unclear.result.pipe(Effect.flip);
+        assert.strictEqual(error._tag, "SyncSetupError");
+        assert.include(error.message, "expected exactly one");
+        assert.isFalse(unclear.stub.calls.some((argv) => argv.includes("xcodebuild")));
+      }
+      assert.strictEqual(yield* recordedBuild, "1");
+
+      const ok = upload({ workspaces: ["Example.xcworkspace"] });
+      yield* ok.result;
+      assert.isTrue(ok.stub.calls.some((argv) => argv.includes("-exportArchive")));
+      const archive = ok.stub.calls.find((argv) => argv.includes("archive"));
+      assert.deepStrictEqual(archive?.slice(4, 9), [
+        "archive",
+        "-workspace",
+        "ios/Example.xcworkspace",
+        "-scheme",
+        "Example",
+      ]);
+      const recorded = yield* readState(stateFile);
+      assert.strictEqual(recorded?.testflight?.buildNumber, "202611090001");
+      assert.deepStrictEqual(recorded?.phone, { delta: "d1", fingerprint: "f1" });
+      assert.isFalse(yield* fs.exists(path.join(iosDir, "Old-1.xcarchive")));
+    }),
+  );
+
+  it("names every reason the phone build is behind, and none when it is current", () => {
+    const uploadedAt = DateTime.makeUnsafe("2026-11-08T22:14:04Z");
+    const upload = {
+      buildNumber: "2",
+      uploadedAt,
+      baseTag: "v0.1.8-nightly.20261108.4380",
+      head: "765d924226",
+      delta: "d1",
+      fingerprint: "f1",
+    };
+    const day = 86_400_000;
+    const afterDays = (days: number) => DateTime.toEpochMillis(uploadedAt) + days * day;
+    const behind = (overrides: Partial<Parameters<typeof phoneBehind>[0]> = {}) =>
+      phoneBehind({
+        upload,
+        current: { delta: "d1", fingerprint: "f1" },
+        nowMillis: afterDays(5),
+        uploadBaseMillis: 0,
+        desktopBaseMillis: 0,
+        ...overrides,
+      });
+
+    assert.deepStrictEqual(behind(), []);
+    assert.deepStrictEqual(behind({ upload: undefined, nowMillis: afterDays(400) }), []);
+    // Without the dogfood's current inputs there is nothing to compare, so only time can speak.
+    assert.deepStrictEqual(behind({ current: undefined }), []);
+
+    assert.deepStrictEqual(behind({ current: { delta: "d2", fingerprint: "f1" } }), [
+      "the fork's changes to the phone's inputs differ",
+    ]);
+    assert.deepStrictEqual(behind({ current: { delta: "d1", fingerprint: "f2" } }), [
+      "the native fingerprint differs",
+    ]);
+
+    // TestFlight keeps a build 90 days: the line appears once fewer than 10 days remain.
+    assert.deepStrictEqual(behind({ nowMillis: afterDays(80) }), []);
+    assert.deepStrictEqual(behind({ nowMillis: afterDays(81) }), ["it expires in 9 days"]);
+    assert.deepStrictEqual(behind({ nowMillis: afterDays(91) }), ["it has expired"]);
+
+    assert.deepStrictEqual(behind({ desktopBaseMillis: 14 * day }), []);
+    assert.deepStrictEqual(behind({ desktopBaseMillis: 15 * day }), [
+      "its base is 15 days older than the desktop build's",
+    ]);
+    assert.deepStrictEqual(
+      behind({ desktopBaseMillis: 40 * day, uploadBaseMillis: undefined }),
+      [],
+    );
+
+    assert.strictEqual(
+      behind({
+        current: { delta: "d2", fingerprint: "f2" },
+        nowMillis: afterDays(85),
+        desktopBaseMillis: 20 * day,
+      }).length,
+      4,
+    );
+  });
+
+  it("numbers builds by UTC minute", () => {
+    assert.strictEqual(iosBuildNumber(DateTime.makeUnsafe("2026-11-08T19:30:45Z")), "202611081930");
+    assert.strictEqual(iosBuildNumber(DateTime.makeUnsafe("2027-01-02T03:04:00Z")), "202701020304");
+    // 19:30 in New York is already the next day in UTC.
+    assert.strictEqual(
+      iosBuildNumber(DateTime.makeUnsafe("2026-11-08T19:30:00-05:00")),
+      "202611090030",
+    );
+  });
+
+  it.effect("hashes only the fork's own changes to the phone's inputs, text or binary", () =>
+    inSandbox((root) =>
+      Effect.gen(function* () {
+        const { dir } = yield* repoWithFile(root);
+        yield* changeFile(dir, "apps/mobile/a.txt", "a\n");
+        yield* changeFile(dir, "apps/mobile/icon.bin", new Uint8Array([0, 1, 2, 3]));
+        yield* git(dir, ["tag", "base"]);
+        const delta = forkDelta(dir, "refs/tags/base");
+
+        const unchanged = yield* delta;
+        // Only the desktop, the server, the web client, and the repository's own scripts changed.
+        for (const file of [
+          "apps/server/b.txt",
+          "apps/desktop/c.txt",
+          "apps/web/d.txt",
+          "scripts/build-desktop-artifact.ts",
+        ]) {
+          yield* changeFile(dir, file, "other\n");
+          assert.strictEqual(yield* delta, unchanged, file);
+        }
+
+        yield* changeFile(dir, "scripts/lib/shared.ts", "shared\n");
+        const shared = yield* delta;
+        assert.notStrictEqual(shared, unchanged);
+        assert.strictEqual(yield* delta, shared);
+
+        yield* changeFile(dir, "apps/mobile/a.txt", "fork\n");
+        const text = yield* delta;
+        assert.notStrictEqual(text, shared);
+
+        yield* changeFile(dir, "apps/mobile/icon.bin", new Uint8Array([0, 1, 2, 4]));
+        assert.notStrictEqual(yield* delta, text);
+      }),
+    ),
+  );
+
+  it.effect("gives the same delta for the same fork change on a base upstream has edited", () =>
+    inSandbox((root) =>
+      Effect.gen(function* () {
+        const { dir } = yield* repoWithFile(root);
+        const lines = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`);
+        const withLine20 = (text: string) =>
+          lines.map((line, index) => (index === 19 ? text : line));
+        yield* changeFile(dir, "apps/mobile/app.txt", `${lines.join("\n")}\n`);
+        yield* git(dir, ["tag", "t1"]);
+        yield* git(dir, ["checkout", "-q", "-b", "fork-on-t1"]);
+        yield* changeFile(dir, "apps/mobile/app.txt", `${withLine20("fork").join("\n")}\n`);
+        const forkCommit = yield* git(dir, ["rev-parse", "HEAD"]);
+        const onT1 = yield* forkDelta(dir, "refs/tags/t1");
+
+        // Upstream prepends lines to the same file: new blob id, shifted line numbers.
+        yield* git(dir, ["checkout", "-q", "main"]);
+        yield* changeFile(dir, "apps/mobile/app.txt", `top\ntop\ntop\n${lines.join("\n")}\n`);
+        yield* git(dir, ["tag", "t2"]);
+        yield* git(dir, ["checkout", "-q", "-b", "fork-on-t2"]);
+        yield* git(dir, ["cherry-pick", forkCommit]);
+
+        assert.strictEqual(yield* forkDelta(dir, "refs/tags/t2"), onT1);
+      }),
+    ),
   );
 });
